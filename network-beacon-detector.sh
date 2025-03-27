@@ -53,17 +53,28 @@ fi
 SCRIPT_VERSION="1.0.0"
 SCRIPT_NAME="network_beacon_detector.sh"
 
-# Function to check for updates (stub - would connect to a central server in production)
-check_for_updates() {
-    print_header "Checking for script updates"
-    log "$(print_info "Current version: $SCRIPT_VERSION")"
+# Trap for cleanup on Ctrl+C or script exit
+cleanup() {
+    echo -e "\n${YELLOW}Cleaning up...${NC}"
+    # Kill traffic generator if running
+    if [ ! -z "$traffic_pid" ] && ps -p $traffic_pid > /dev/null 2>&1; then
+        kill $traffic_pid 2>/dev/null
+    fi
     
-    # In a real implementation, this would check a remote server
-    # For this example, we'll just show the concept
-    echo "Checking for updates..."
-    echo "Latest version: $SCRIPT_VERSION"
-    echo "Your script is up to date!"
+    # Kill all tcpdump processes
+    for pid in $tcpdump_pid $http_pid $dns_pid $icmp_pid $smb_pid $uncommon_pid; do
+        if [ ! -z "$pid" ] && ps -p $pid > /dev/null 2>&1; then
+            kill -9 $pid 2>/dev/null
+        fi
+    done
+    
+    echo -e "${YELLOW}Capture terminated. Results saved to $OUTPUT_DIR${NC}"
+    exit 1
 }
+
+# Set up trap for SIGINT (Ctrl+C) and EXIT
+trap cleanup SIGINT
+trap cleanup EXIT
 
 # Color codes for output formatting
 RED='\033[0;31m'
@@ -154,11 +165,10 @@ for tool in strace volatility yara; do
         esac
     else
         echo -e "${GREEN}[+] Optional tool available: $tool${NC}"
-        ;;
     fi
 done
 
-# Create timestamp and output directory
+# Create a timestamp for the output directory
 TIMESTAMP=$(date +"%Y%m%d-%H%M%S")
 OUTPUT_DIR="./network_beacon_scan_$TIMESTAMP"
 mkdir -p "$OUTPUT_DIR"
@@ -168,6 +178,7 @@ mkdir -p "$OUTPUT_DIR/analysis"
 
 CAPTURE_FILE="$OUTPUT_DIR/pcaps/capture.pcap"
 RESULTS_FILE="$OUTPUT_DIR/beacon_results.txt"
+touch "$RESULTS_FILE"
 
 # Function to log output to file and screen
 log() {
@@ -182,6 +193,10 @@ log "Network C2 Beacon Detection - $(date)"
 log "=========================================="
 log "Capture time: $CAPTURE_TIME seconds"
 log "Output directory: $OUTPUT_DIR"
+
+# Set the CAPTURE_TIME variable explicitly to an integer
+# This should fix any issues with variable interpretation
+CAPTURE_TIME=$(($CAPTURE_TIME + 0))
 
 # Get system information
 HOSTNAME=$(hostname)
@@ -621,7 +636,7 @@ perform_memory_analysis() {
 }
 
 # Parse network interfaces
-all_interfaces=$(ip -o link show | awk -F': ' '{print $2}' | grep -v "lo")
+all_interfaces=$(ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | grep -v "lo" || ifconfig -a 2>/dev/null | grep -v "lo" | grep -E "^[a-z]" | awk '{print $1}')
 
 print_header "Available Network Interfaces"
 echo "$all_interfaces" | while read -r interface; do
@@ -643,51 +658,79 @@ else
     capture_interface="$EXTRA_INTERFACES"
 fi
 
+# Generate some test traffic if requested
+echo -e "${YELLOW}Would you like to generate some test traffic during capture? (y/n)${NC}"
+read -p "" -n 1 -r
+echo
+if [[ $REPLY =~ ^[Yy]$ ]]; then
+    echo -e "${GREEN}Will generate test traffic during capture.${NC}"
+    # Start background process for test traffic
+    {
+        # Wait a few seconds for capture to start
+        sleep 2
+        
+        # Generate DNS traffic
+        for domain in google.com facebook.com microsoft.com example.com test-beacon.local; do
+            nslookup $domain &>/dev/null
+            sleep 3
+        done
+        
+        # Generate HTTP traffic
+        for site in google.com example.com github.com; do
+            curl -s -o /dev/null http://$site &>/dev/null
+            sleep 2
+        done
+        
+        # Generate HTTPS traffic
+        for site in google.com github.com microsoft.com; do
+            curl -s -o /dev/null https://$site &>/dev/null
+            sleep 2
+        done
+        
+        # ICMP traffic
+        ping -c 3 8.8.8.8 &>/dev/null
+        sleep 1
+        ping -c 3 1.1.1.1 &>/dev/null
+        
+    } &
+    traffic_pid=$!
+    
+    # Make sure to kill this process when script exits
+    trap "kill $traffic_pid 2>/dev/null" EXIT
+fi
+
 # Start capture
 print_header "Starting Network Capture"
 log "$(print_info "Capturing traffic on interface(s): $capture_interface for $CAPTURE_TIME seconds...")"
 log "$(print_info "Press Ctrl+C to stop capture early")"
 
+# Force flush the log file to ensure log messages appear correctly
+sync
+
 # BPF filter for C2 traffic
-C2_FILTER='(
-    port 80 or port 443 or port 53 or                      # HTTP, HTTPS, DNS
-    port 22 or port 23 or port 21 or port 3389 or          # SSH, Telnet, FTP, RDP
-    port 4444 or port 8080 or port 8443 or                 # Common C2 ports
-    port 1080 or port 1443 or port 9001 or port 9002 or    # Proxies and more C2
-    icmp or                                                # ICMP tunneling
-    udp port 53 or                                         # DNS over UDP
-    port 137 or port 138 or port 445 or                    # SMB/NetBIOS
-    port 5353 or port 5355 or                              # mDNS and LLMNR
-    port 6667 or                                           # IRC (common for botnets)
-    proto 47 or                                            # GRE tunneling
-    port 2222 or port 6666 or port 31337                   # Common backdoor ports
-)'
+C2_FILTER='(port 80 or port 443 or port 53 or port 22 or port 23 or port 21 or port 3389 or port 4444 or port 8080 or port 8443 or port 1080 or port 1443 or port 9001 or port 9002 or icmp or udp port 53 or port 137 or port 138 or port 445 or port 5353 or port 5355 or port 6667 or proto 47 or port 2222 or port 6666 or port 31337)'
 
 # Create separate captures for different protocol groups for easier analysis
 log "$(print_info "Creating separate captures for protocol analysis...")"
+sync
 
-# HTTP/HTTPS
-tcpdump -i $capture_interface -s0 -w "$OUTPUT_DIR/pcaps/http_https.pcap" '(port 80 or port 443)' -G $CAPTURE_TIME -W 1 2>/dev/null &
+# Make sure the command doesn't run too long by using timeout, and run the process in the background
+timeout $CAPTURE_TIME tcpdump -i $capture_interface -s0 -w "$OUTPUT_DIR/pcaps/http_https.pcap" '(port 80 or port 443)' 2>/dev/null &
 http_pid=$!
 
-# DNS
-tcpdump -i $capture_interface -s0 -w "$OUTPUT_DIR/pcaps/dns.pcap" '(port 53)' -G $CAPTURE_TIME -W 1 2>/dev/null &
+timeout $CAPTURE_TIME tcpdump -i $capture_interface -s0 -w "$OUTPUT_DIR/pcaps/dns.pcap" '(port 53)' 2>/dev/null &
 dns_pid=$!
 
-# ICMP
-tcpdump -i $capture_interface -s0 -w "$OUTPUT_DIR/pcaps/icmp.pcap" 'icmp' -G $CAPTURE_TIME -W 1 2>/dev/null &
+timeout $CAPTURE_TIME tcpdump -i $capture_interface -s0 -w "$OUTPUT_DIR/pcaps/icmp.pcap" 'icmp' 2>/dev/null &
 icmp_pid=$!
 
-# SMB/NetBIOS
-tcpdump -i $capture_interface -s0 -w "$OUTPUT_DIR/pcaps/smb.pcap" '(port 137 or port 138 or port 445)' -G $CAPTURE_TIME -W 1 2>/dev/null &
+timeout $CAPTURE_TIME tcpdump -i $capture_interface -s0 -w "$OUTPUT_DIR/pcaps/smb.pcap" '(port 137 or port 138 or port 445)' 2>/dev/null &
 smb_pid=$!
 
-# Uncommon C2 ports
-tcpdump -i $capture_interface -s0 -w "$OUTPUT_DIR/pcaps/uncommon.pcap" '(port 4444 or port 8080 or port 8443 or port 1080 or port 1443 or port 9001 or port 9002 or port 2222 or port 6666 or port 31337)' -G $CAPTURE_TIME -W 1 2>/dev/null &
+timeout $CAPTURE_TIME tcpdump -i $capture_interface -s0 -w "$OUTPUT_DIR/pcaps/uncommon.pcap" '(port 4444 or port 8080 or port 8443 or port 1080 or port 1443 or port 9001 or port 9002 or port 2222 or port 6666 or port 31337)' 2>/dev/null &
 uncommon_pid=$!
 
-# Full capture (everything)
-tcpdump -i $capture_interface -s0 -w "$CAPTURE_FILE" "$C2_FILTER" -G $CAPTURE_TIME -W 1 2>/dev/null &
+timeout $CAPTURE_TIME tcpdump -i $capture_interface -s0 -w "$CAPTURE_FILE" "$C2_FILTER" 2>/dev/null &
 tcpdump_pid=$!
 
 # Show progress
@@ -699,15 +742,60 @@ for i in {1..60}; do
     sleep 1
 done
 
-# Ensure tcpdump is stopped
-if kill -0 $tcpdump_pid 2>/dev/null; then
-    kill $tcpdump_pid
-    wait $tcpdump_pid 2>/dev/null
-fi
+# Ensure all tcpdump processes are stopped after the capture period
+echo -e "\n\n${GREEN}Capture phase completed after $CAPTURE_TIME seconds. Processing results...${NC}\n"
+log "$(print_success "Capture completed after $CAPTURE_TIME seconds")"
 
-echo -e "\n"
-log "$(print_success "Capture completed")"
-log "$(print_info "Captured $(du -h "$CAPTURE_FILE" | cut -f1) of network traffic")"
+for pid in $tcpdump_pid $http_pid $dns_pid $icmp_pid $smb_pid $uncommon_pid; do
+    if ps -p $pid > /dev/null 2>&1; then
+        kill -TERM $pid 2>/dev/null
+        # Give it a second to clean up
+        sleep 1
+        # Force kill if still running
+        if ps -p $pid > /dev/null 2>&1; then
+            kill -9 $pid 2>/dev/null
+        fi
+    fi
+done
+
+# Check if any capture files were created and have content
+capture_files_exist=false
+for capfile in "$CAPTURE_FILE" "$OUTPUT_DIR/pcaps/http_https.pcap" "$OUTPUT_DIR/pcaps/dns.pcap" "$OUTPUT_DIR/pcaps/icmp.pcap" "$OUTPUT_DIR/pcaps/smb.pcap" "$OUTPUT_DIR/pcaps/uncommon.pcap"; do
+    if [ -f "$capfile" ]; then
+        filesize=$(stat -c%s "$capfile" 2>/dev/null || echo 0)
+        if [ "$filesize" -gt 100 ]; then  # Consider files larger than 100 bytes to have useful content
+            capture_files_exist=true
+            log "$(print_info "Captured $(du -h "$capfile" | cut -f1) of traffic in $(basename "$capfile")")"
+        else
+            log "$(print_info "File $(basename "$capfile") exists but contains minimal data ($(stat -c%s "$capfile" 2>/dev/null || echo 0) bytes)")"
+        fi
+    else
+        log "$(print_info "No data captured in $(basename "$capfile")")"
+    fi
+done
+
+if [ "$capture_files_exist" = false ]; then
+    log "$(print_alert "WARNING: No substantial traffic was captured! This could be due to:")"
+    log "$(print_info "  - No matching network activity during capture period")"
+    log "$(print_info "  - Issues with capture permissions or interfaces")"
+    log "$(print_info "  - BPF filter too restrictive")"
+    
+    # Create an empty file to ensure subsequent commands don't fail
+    for capfile in "$CAPTURE_FILE" "$OUTPUT_DIR/pcaps/http_https.pcap" "$OUTPUT_DIR/pcaps/dns.pcap" "$OUTPUT_DIR/pcaps/icmp.pcap" "$OUTPUT_DIR/pcaps/smb.pcap" "$OUTPUT_DIR/pcaps/uncommon.pcap"; do
+        if [ ! -f "$capfile" ]; then
+            touch "$capfile"
+        fi
+    done
+    
+    # Ask if user wants to continue with analysis even though capture was empty
+    echo -e "${YELLOW}No substantial traffic was captured. Continue with analysis anyway? (y/n)${NC}"
+    read -p "" -n 1 -r
+    echo
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+        echo -e "${RED}Analysis cancelled. Please check your network configuration and try again.${NC}"
+        exit 1
+    fi
+fi
 
 # Analyze for beaconing patterns in each protocol
 detect_beacons "HTTP" "$CAPTURE_FILE"
@@ -724,20 +812,43 @@ identify_beacon_processes
 # Generate summary statistics
 print_header "Beacon Detection Summary"
 
-# Count detected beacons
-http_beacons=$(grep -c "Potential HTTP beacon detected" "$RESULTS_FILE" || echo 0)
-https_beacons=$(grep -c "Potential HTTPS beacon detected" "$RESULTS_FILE" || echo 0)
-dns_beacons=$(grep -c "Potential DNS beacon detected" "$RESULTS_FILE" || echo 0)
-icmp_beacons=$(grep -c "Potential ICMP beacon detected" "$RESULTS_FILE" || echo 0)
-tcp_uncommon_beacons=$(grep -c "Potential TCP_UNCOMMON beacon detected" "$RESULTS_FILE" || echo 0)
-udp_uncommon_beacons=$(grep -c "Potential UDP_UNCOMMON beacon detected" "$RESULTS_FILE" || echo 0)
-smb_beacons=$(grep -c "Potential SMB beacon detected" "$RESULTS_FILE" || echo 0)
-dns_tunneling=$(grep -c "Potential DNS tunneling detected" "$RESULTS_FILE" || echo 0)
-icmp_tunneling=$(grep -c "Potential ICMP tunneling detected" "$RESULTS_FILE" || echo 0)
-udp_tunneling=$(grep -c "Potential UDP tunneling detected" "$RESULTS_FILE" || echo 0)
+# Count detected beacons - using safer syntax that handles the case when grep doesn't find anything
+http_beacons=$(grep -c "Potential HTTP beacon detected" "$RESULTS_FILE" 2>/dev/null || echo 0)
+https_beacons=$(grep -c "Potential HTTPS beacon detected" "$RESULTS_FILE" 2>/dev/null || echo 0)
+dns_beacons=$(grep -c "Potential DNS beacon detected" "$RESULTS_FILE" 2>/dev/null || echo 0)
+icmp_beacons=$(grep -c "Potential ICMP beacon detected" "$RESULTS_FILE" 2>/dev/null || echo 0)
+tcp_uncommon_beacons=$(grep -c "Potential TCP_UNCOMMON beacon detected" "$RESULTS_FILE" 2>/dev/null || echo 0)
+udp_uncommon_beacons=$(grep -c "Potential UDP_UNCOMMON beacon detected" "$RESULTS_FILE" 2>/dev/null || echo 0)
+smb_beacons=$(grep -c "Potential SMB beacon detected" "$RESULTS_FILE" 2>/dev/null || echo 0)
+dns_tunneling=$(grep -c "Potential DNS tunneling detected" "$RESULTS_FILE" 2>/dev/null || echo 0)
+icmp_tunneling=$(grep -c "Potential ICMP tunneling detected" "$RESULTS_FILE" 2>/dev/null || echo 0)
+udp_tunneling=$(grep -c "Potential UDP tunneling detected" "$RESULTS_FILE" 2>/dev/null || echo 0)
 
-total_beacons=$((http_beacons + https_beacons + dns_beacons + icmp_beacons + tcp_uncommon_beacons + udp_uncommon_beacons + smb_beacons))
-total_tunneling=$((dns_tunneling + icmp_tunneling + udp_tunneling))
+# Make sure variables are integers
+http_beacons=$(echo $http_beacons | grep -o '[0-9]*')
+[ -z "$http_beacons" ] && http_beacons=0
+https_beacons=$(echo $https_beacons | grep -o '[0-9]*') 
+[ -z "$https_beacons" ] && https_beacons=0
+dns_beacons=$(echo $dns_beacons | grep -o '[0-9]*')
+[ -z "$dns_beacons" ] && dns_beacons=0
+icmp_beacons=$(echo $icmp_beacons | grep -o '[0-9]*')
+[ -z "$icmp_beacons" ] && icmp_beacons=0
+tcp_uncommon_beacons=$(echo $tcp_uncommon_beacons | grep -o '[0-9]*')
+[ -z "$tcp_uncommon_beacons" ] && tcp_uncommon_beacons=0
+udp_uncommon_beacons=$(echo $udp_uncommon_beacons | grep -o '[0-9]*')
+[ -z "$udp_uncommon_beacons" ] && udp_uncommon_beacons=0
+smb_beacons=$(echo $smb_beacons | grep -o '[0-9]*')
+[ -z "$smb_beacons" ] && smb_beacons=0
+dns_tunneling=$(echo $dns_tunneling | grep -o '[0-9]*')
+[ -z "$dns_tunneling" ] && dns_tunneling=0
+icmp_tunneling=$(echo $icmp_tunneling | grep -o '[0-9]*')
+[ -z "$icmp_tunneling" ] && icmp_tunneling=0
+udp_tunneling=$(echo $udp_tunneling | grep -o '[0-9]*')
+[ -z "$udp_tunneling" ] && udp_tunneling=0
+
+# Calculate totals using integer arithmetic
+total_beacons=$(( http_beacons + https_beacons + dns_beacons + icmp_beacons + tcp_uncommon_beacons + udp_uncommon_beacons + smb_beacons ))
+total_tunneling=$(( dns_tunneling + icmp_tunneling + udp_tunneling ))
 
 log "Detection completed at $(date)"
 log "-------------------- BEACON DETECTION SUMMARY --------------------"
@@ -999,9 +1110,21 @@ fi
 echo -e "\n${GREEN}===== Beacon Detection Completed! =====${NC}"
 echo -e "${YELLOW}Results saved to: $OUTPUT_DIR${NC}"
 
-if [ $total_beacons -gt 0 ]; then
+# Make sure total_beacons is an integer
+[ -z "$total_beacons" ] && total_beacons=0
+[ "$total_beacons" = "" ] && total_beacons=0
+
+if [ "$total_beacons" -gt 0 ]; then
     echo -e "${RED}WARNING: $total_beacons potential C2 beacons detected!${NC}"
-    echo -e "${RED}ADDITIONAL WARNING: $total_tunneling potential data tunneling techniques detected!${NC}"
+    
+    # Make sure total_tunneling is an integer
+    [ -z "$total_tunneling" ] && total_tunneling=0
+    [ "$total_tunneling" = "" ] && total_tunneling=0
+    
+    if [ "$total_tunneling" -gt 0 ]; then
+        echo -e "${RED}ADDITIONAL WARNING: $total_tunneling potential data tunneling techniques detected!${NC}"
+    fi
+    
     echo -e "\n${YELLOW}Details:${NC}"
     echo -e " - HTTP beacons: ${RED}$http_beacons${NC}"
     echo -e " - HTTPS beacons: ${RED}$https_beacons${NC}"
@@ -1012,14 +1135,18 @@ if [ $total_beacons -gt 0 ]; then
     # Show processes to investigate
     if [ -f "$OUTPUT_DIR/beacon_candidates.txt" ]; then
         echo -e "\n${YELLOW}Processes to investigate:${NC}"
-        processes=$(grep -oE '\|[^|]+\|([0-9]+)' "$OUTPUT_DIR/beacon_candidates.txt" | grep -oE '[0-9]+' | sort -u)
-        for pid in $processes; do
-            if kill -0 $pid 2>/dev/null; then
-                cmd=$(ps -p $pid -o cmd= 2>/dev/null || echo "Unknown")
-                user=$(ps -p $pid -o user= 2>/dev/null || echo "Unknown")
-                echo -e " - ${RED}PID $pid${NC} ($user): $cmd"
-            fi
-        done
+        processes=$(grep -oE '\|[^|]+\|([0-9]+)' "$OUTPUT_DIR/beacon_candidates.txt" 2>/dev/null | grep -oE '[0-9]+' | sort -u)
+        if [ ! -z "$processes" ]; then
+            for pid in $processes; do
+                if kill -0 $pid 2>/dev/null; then
+                    cmd=$(ps -p $pid -o cmd= 2>/dev/null || echo "Unknown")
+                    user=$(ps -p $pid -o user= 2>/dev/null || echo "Unknown")
+                    echo -e " - ${RED}PID $pid${NC} ($user): $cmd"
+                fi
+            done
+        else
+            echo -e " ${YELLOW}No active suspicious processes found${NC}"
+        fi
     fi
     
     # Open HTML report if available

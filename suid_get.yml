@@ -1,0 +1,54 @@
+---
+# Playbook: suid_get.yml
+# Purpose: Find and report all SUID files on target systems
+- name: Check for SUID files
+  hosts: all
+  become: yes  # Run with elevated privileges
+  vars:
+    output_dir: "/tmp/security_audit"
+    timestamp: "{{ ansible_date_time.date }}_{{ ansible_date_time.time | regex_replace(':', '-') }}"
+    exclusion_paths:
+      - "/proc"
+      - "/sys"
+      - "/run"
+      - "/dev"
+      
+  tasks:
+    - name: Create local output directory if it doesn't exist
+      ansible.builtin.file:
+        path: "{{ output_dir }}"
+        state: directory
+        mode: '0755'
+      delegate_to: localhost
+      become: no
+      run_once: yes
+      
+    - name: Find all SUID files
+      ansible.builtin.shell: find / -path /proc -prune -o -path /sys -prune -o -path /run -prune -o -path /dev -prune -o -perm -4000 -type f -print 2>/dev/null
+      register: suid_files
+      args:
+        executable: /bin/bash
+      changed_when: false
+      
+    - name: Save SUID files list to host-specific file
+      ansible.builtin.copy:
+        content: "# SUID Files on {{ inventory_hostname }} ({{ ansible_date_time.iso8601 }})\n{{ suid_files.stdout }}"
+        dest: "{{ output_dir }}/{{ inventory_hostname }}_suid_files_{{ timestamp }}.txt"
+      delegate_to: localhost
+      become: no
+      
+    - name: Count SUID files found
+      ansible.builtin.set_fact:
+        suid_count: "{{ suid_files.stdout_lines | length }}"
+        
+    - name: Show summary of SUID files found
+      ansible.builtin.debug:
+        msg: "Found {{ suid_count }} SUID files on {{ inventory_hostname }}"
+        
+    - name: Create consolidated report
+      ansible.builtin.lineinfile:
+        path: "{{ output_dir }}/suid_summary_{{ timestamp }}.csv"
+        line: "{{ inventory_hostname }},{{ ansible_distribution }},{{ ansible_distribution_version }},{{ suid_count }}"
+        create: yes
+      delegate_to: localhost
+      become: no

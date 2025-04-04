@@ -1,0 +1,133 @@
+---
+# Playbook: suid_set.yml
+# Purpose: Identify and remove unnecessary SUID bits from custom files
+- name: Remove unnecessary SUID bits
+  hosts: all
+  become: yes  # Run with elevated privileges
+  vars:
+    # List of files/binaries that should retain SUID permissions
+    suid_whitelist:
+      - /usr/bin/sudo
+      - /usr/bin/su
+      - /usr/bin/passwd
+      - /usr/bin/chsh
+      - /usr/bin/chfn
+      - /usr/bin/gpasswd
+      - /usr/bin/newgrp
+      - /usr/bin/mount
+      - /usr/bin/umount
+      - /usr/bin/ping
+      - /usr/bin/fusermount
+      - /usr/bin/pkexec
+      - /usr/lib/policykit-1/polkit-agent-helper-1
+      - /usr/lib/dbus-1.0/dbus-daemon-launch-helper
+      - /usr/lib/openssh/ssh-keysign
+      - /usr/sbin/pppd
+      # Add more legitimate SUID binaries as needed
+      
+    # Define paths to exclude from scanning
+    exclusion_paths:
+      - "/proc"
+      - "/sys"
+      - "/run"
+      - "/dev"
+      
+    # Backup directory for permissions
+    backup_dir: "/root/suid_permissions_backup"
+    
+    # Timestamp for backups
+    timestamp: "{{ ansible_date_time.date }}_{{ ansible_date_time.time | regex_replace(':', '-') }}"
+      
+  tasks:
+    - name: Create backup directory
+      ansible.builtin.file:
+        path: "{{ backup_dir }}"
+        state: directory
+        mode: '0700'
+        owner: root
+        group: root
+      
+    - name: Find all SUID files
+      ansible.builtin.shell: find / -path /proc -prune -o -path /sys -prune -o -path /run -prune -o -path /dev -prune -o -perm -4000 -type f -print 2>/dev/null
+      register: suid_files
+      args:
+        executable: /bin/bash
+      changed_when: false
+      
+    - name: Save current SUID files list (before changes)
+      ansible.builtin.copy:
+        content: "# SUID Files on {{ inventory_hostname }} ({{ ansible_date_time.iso8601 }}) - BEFORE CHANGES\n{{ suid_files.stdout }}"
+        dest: "{{ backup_dir }}/suid_files_before_{{ timestamp }}.txt"
+      
+    - name: Identify non-whitelisted SUID files
+      ansible.builtin.set_fact:
+        custom_suid_files: "{{ suid_files.stdout_lines | difference(suid_whitelist) }}"
+      
+    - name: Display non-whitelisted SUID files that will be modified
+      ansible.builtin.debug:
+        msg: "The following SUID files are not in the whitelist and will be modified: {{ custom_suid_files }}"
+      when: custom_suid_files | length > 0
+      
+    - name: Create detailed backup of file permissions
+      ansible.builtin.shell: "stat -c '%n,%a,%U,%G' {{ item }}"
+      loop: "{{ custom_suid_files }}"
+      register: file_permissions
+      changed_when: false
+      when: custom_suid_files | length > 0
+      
+    - name: Save detailed permissions backup
+      ansible.builtin.copy:
+        content: "# File permissions backup on {{ inventory_hostname }} ({{ ansible_date_time.iso8601 }})\n# Format: filename,permissions,owner,group\n{% for result in file_permissions.results %}{% if result is defined %}{{ result.stdout }}\n{% endif %}{% endfor %}"
+        dest: "{{ backup_dir }}/suid_permissions_backup_{{ timestamp }}.csv"
+      when: custom_suid_files | length > 0
+      
+    - name: Remove SUID bit from non-whitelisted files
+      ansible.builtin.file:
+        path: "{{ item }}"
+        mode: "u-s,g-s"
+      loop: "{{ custom_suid_files }}"
+      register: suid_removed
+      when: custom_suid_files | length > 0
+      
+    - name: Find all SUID files after changes
+      ansible.builtin.shell: find / -path /proc -prune -o -path /sys -prune -o -path /run -prune -o -path /dev -prune -o -perm -4000 -type f -print 2>/dev/null
+      register: suid_files_after
+      args:
+        executable: /bin/bash
+      changed_when: false
+      
+    - name: Save SUID files list (after changes)
+      ansible.builtin.copy:
+        content: "# SUID Files on {{ inventory_hostname }} ({{ ansible_date_time.iso8601 }}) - AFTER CHANGES\n{{ suid_files_after.stdout }}"
+        dest: "{{ backup_dir }}/suid_files_after_{{ timestamp }}.txt"
+      
+    - name: Generate summary report
+      ansible.builtin.copy:
+        content: |
+          # SUID Permissions Modification Report
+          Host: {{ inventory_hostname }}
+          Date: {{ ansible_date_time.iso8601 }}
+          
+          Total SUID files found: {{ suid_files.stdout_lines | length }}
+          Whitelisted SUID files: {{ suid_whitelist | length }}
+          Custom SUID files modified: {{ custom_suid_files | length }}
+          
+          Files modified:
+          {% for file in custom_suid_files %}
+          - {{ file }}
+          {% endfor %}
+          
+          Backup files:
+          - {{ backup_dir }}/suid_files_before_{{ timestamp }}.txt
+          - {{ backup_dir }}/suid_permissions_backup_{{ timestamp }}.csv
+          - {{ backup_dir }}/suid_files_after_{{ timestamp }}.txt
+        dest: "{{ backup_dir }}/summary_report_{{ timestamp }}.txt"
+      
+    - name: Display summary
+      ansible.builtin.debug:
+        msg: |
+          SUID Bit Removal Summary:
+          - Found {{ suid_files.stdout_lines | length }} total SUID files
+          - Modified {{ custom_suid_files | length }} non-whitelisted files
+          - {{ suid_files_after.stdout_lines | length }} SUID files remain
+          - Detailed backups saved to {{ backup_dir }}

@@ -1,0 +1,197 @@
+---
+# Playbook: crontab_get.yml
+# Purpose: Audit all user crontabs and system crontab files for suspicious commands
+- name: Check crontab files for suspicious commands
+  hosts: all
+  become: yes  # Run with elevated privileges
+  vars:
+    output_dir: "/tmp/security_audit/crontabs"
+    timestamp: "{{ ansible_date_time.date }}_{{ ansible_date_time.time | regex_replace(':', '-') }}"
+    
+    # List of suspicious patterns to check for in crontab entries
+    suspicious_patterns:
+      - "curl.*\\|\\s*bash"        # Curl piped to bash
+      - "wget.*\\|\\s*bash"        # Wget piped to bash
+      - "nc\\s+-e"                 # Netcat with execute flag
+      - "bash\\s+-i"               # Interactive bash shell
+      - "chmod\\s+777"             # Setting world-writable permissions
+      - "\\.\\./\\.\\."            # Path traversal attempts
+      - "/dev/tcp/"                # Bash network redirection
+      - "\\$\\(curl"               # Command substitution with curl
+      - "\\$\\(wget"               # Command substitution with wget
+      - "eval.*base64"             # Eval with base64 (common obfuscation)
+      - "python\\s+-c"             # Inline Python execution
+      - "perl\\s+-e"               # Inline Perl execution
+      - "\\$\\(mktemp\\s+-u\\)"    # Create temp file and execute
+      - "0\\.0\\.0\\.0"            # Binding to all interfaces
+      - "::"                       # IPv6 binding to all interfaces
+      
+    # System crontab locations to check
+    crontab_files:
+      - "/etc/crontab"
+      - "/etc/cron.d/"
+      - "/etc/cron.hourly/"
+      - "/etc/cron.daily/"
+      - "/etc/cron.weekly/"
+      - "/etc/cron.monthly/"
+      
+  tasks:
+    - name: Create local output directory if it doesn't exist
+      ansible.builtin.file:
+        path: "{{ output_dir }}"
+        state: directory
+        mode: '0755'
+      delegate_to: localhost
+      become: no
+      run_once: yes
+      
+    - name: Get list of all users
+      ansible.builtin.getent:
+        database: passwd
+      register: all_users
+      
+    - name: Extract local user accounts
+      ansible.builtin.set_fact:
+        local_users: "{{ all_users.ansible_facts.getent_passwd | dict2items | 
+                       selectattr('value.1', 'match', '^[1-9]\\d{3}$') | 
+                       map(attribute='key') | list }}"
+      
+    - name: Create per-host directory
+      ansible.builtin.file:
+        path: "{{ output_dir }}/{{ inventory_hostname }}"
+        state: directory
+        mode: '0755'
+      delegate_to: localhost
+      become: no
+      
+    # Check user crontabs
+    - name: Check user crontabs
+      ansible.builtin.shell: crontab -l -u {{ item }} 2>/dev/null || echo "# No crontab for {{ item }}"
+      loop: "{{ local_users }}"
+      register: user_crontabs
+      failed_when: false
+      changed_when: false
+      
+    - name: Save user crontabs to files
+      ansible.builtin.copy:
+        content: "# Crontab for user {{ user_crontabs.results[idx].item }} on {{ inventory_hostname }} ({{ ansible_date_time.iso8601 }})\n{{ user_crontabs.results[idx].stdout }}"
+        dest: "{{ output_dir }}/{{ inventory_hostname }}/user_{{ user_crontabs.results[idx].item }}_crontab.txt"
+      delegate_to: localhost
+      become: no
+      loop: "{{ range(0, user_crontabs.results | length) | list }}"
+      loop_control:
+        loop_var: idx
+      when: user_crontabs.results[idx].stdout is defined and user_crontabs.results[idx].stdout != "# No crontab for {{ user_crontabs.results[idx].item }}"
+      
+    # Check system crontab files
+    - name: Find system crontab files
+      ansible.builtin.find:
+        paths: "{{ crontab_files }}"
+        file_type: any
+        recurse: no
+      register: system_crontab_files
+      failed_when: false
+      
+    - name: Read system crontab files
+      ansible.builtin.slurp:
+        src: "{{ item.path }}"
+      loop: "{{ system_crontab_files.files }}"
+      register: system_crontabs_content
+      failed_when: false
+      
+    - name: Save system crontab files
+      ansible.builtin.copy:
+        content: "# System crontab file: {{ system_crontabs_content.results[idx].item.path }} on {{ inventory_hostname }} ({{ ansible_date_time.iso8601 }})\n{{ system_crontabs_content.results[idx].content | b64decode }}"
+        dest: "{{ output_dir }}/{{ inventory_hostname }}/system_crontab_{{ system_crontabs_content.results[idx].item.path | basename | regex_replace('[^a-zA-Z0-9_-]', '_') }}.txt"
+      delegate_to: localhost
+      become: no
+      loop: "{{ range(0, system_crontabs_content.results | length) | list }}"
+      loop_control:
+        loop_var: idx
+      when: system_crontabs_content.results[idx].content is defined
+      
+    # Scan for suspicious patterns
+    - name: Scan user crontabs for suspicious patterns
+      ansible.builtin.shell: |
+        result=""
+        {% for pattern in suspicious_patterns %}
+        grep -E "{{ pattern }}" <(echo "{{ user_crontabs.results[idx].stdout }}") > /dev/null 2>&1
+        if [ $? -eq 0 ]; then
+          result="${result}SUSPICIOUS PATTERN FOUND: '{{ pattern }}' in user {{ user_crontabs.results[idx].item }} crontab\n"
+          result="${result}$(grep -E '{{ pattern }}' <(echo '{{ user_crontabs.results[idx].stdout }}'))\n\n"
+        fi
+        {% endfor %}
+        echo -e "$result"
+      args:
+        executable: /bin/bash
+      register: user_suspicious_patterns
+      loop: "{{ range(0, user_crontabs.results | length) | list }}"
+      loop_control:
+        loop_var: idx
+      when: user_crontabs.results[idx].stdout is defined and user_crontabs.results[idx].stdout != "# No crontab for {{ user_crontabs.results[idx].item }}"
+      changed_when: false
+      
+    - name: Scan system crontabs for suspicious patterns
+      ansible.builtin.shell: |
+        result=""
+        {% for pattern in suspicious_patterns %}
+        grep -E "{{ pattern }}" <(echo "{{ system_crontabs_content.results[idx].content | b64decode }}") > /dev/null 2>&1
+        if [ $? -eq 0 ]; then
+          result="${result}SUSPICIOUS PATTERN FOUND: '{{ pattern }}' in {{ system_crontabs_content.results[idx].item.path }}\n"
+          result="${result}$(grep -E '{{ pattern }}' <(echo '{{ system_crontabs_content.results[idx].content | b64decode }}'))\n\n"
+        fi
+        {% endfor %}
+        echo -e "$result"
+      args:
+        executable: /bin/bash
+      register: system_suspicious_patterns
+      loop: "{{ range(0, system_crontabs_content.results | length) | list }}"
+      loop_control:
+        loop_var: idx
+      when: system_crontabs_content.results[idx].content is defined
+      changed_when: false
+      
+    # Generate summary reports
+    - name: Create suspicious patterns report
+      ansible.builtin.copy:
+        content: |
+          # Suspicious Crontab Entries on {{ inventory_hostname }} ({{ ansible_date_time.iso8601 }})
+          
+          ## USER CRONTABS
+          {% for result in user_suspicious_patterns.results %}
+          {% if result.stdout is defined and result.stdout | trim != '' %}
+          {{ result.stdout }}
+          {% endif %}
+          {% endfor %}
+          
+          ## SYSTEM CRONTABS
+          {% for result in system_suspicious_patterns.results %}
+          {% if result.stdout is defined and result.stdout | trim != '' %}
+          {{ result.stdout }}
+          {% endif %}
+          {% endfor %}
+        dest: "{{ output_dir }}/{{ inventory_hostname }}/suspicious_crontab_entries_{{ timestamp }}.txt"
+      delegate_to: localhost
+      become: no
+
+    - name: Generate consolidated findings report
+      ansible.builtin.set_fact:
+        suspicious_findings: "{{ user_suspicious_patterns.results | selectattr('stdout', 'defined') | selectattr('stdout', 'ne', '') | list | length +
+                               system_suspicious_patterns.results | selectattr('stdout', 'defined') | selectattr('stdout', 'ne', '') | list | length }}"
+      
+    - name: Report findings summary
+      ansible.builtin.debug:
+        msg: |
+          Crontab security scan completed for {{ inventory_hostname }}:
+          - Checked {{ local_users | length }} user crontabs
+          - Checked {{ system_crontabs_content.results | length }} system crontab files
+          - Found {{ suspicious_findings }} potentially suspicious entries
+          - Full reports saved to {{ output_dir }}/{{ inventory_hostname }}/
+      
+    - name: Add host to consolidated report
+      ansible.builtin.lineinfile:
+        path: "{{ output_dir }}/consolidated_report_{{ timestamp }}.csv"
+        line: "{{ inventory_hostname }},{{ ansible_distribution }},{{ ansible_distribution_version }},{{ local_users | length }},{{ system_crontabs_content.results | length }},{{ suspicious_findings }}"
+        create: yes
+      delegate_to: localhost
+      become: no

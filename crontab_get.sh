@@ -1,6 +1,6 @@
 #!/bin/sh
 
-# id: crontab_security_audit
+# id: crontab_get
 # author: Stefan Olaru
 # tags: linux debian-based redhat-based freebsd-based
 
@@ -63,29 +63,81 @@ for crondir in /etc/cron.d /etc/cron.daily /etc/cron.hourly /etc/cron.weekly /et
     fi
 done
 
-# Check for suspicious patterns
+# Check for suspicious patterns - using POSIX compliant approach without arrays
 echo "Scanning for suspicious patterns..."
-SUSPICIOUS_PATTERNS=(
-    "curl.*\|.*bash"      # Curl piped to bash
-    "wget.*\|.*bash"      # Wget piped to bash
-    "nc -e"               # Netcat with execute flag
-    "bash -i"             # Interactive bash shell
-    "chmod 777"           # Insecure permissions
-    "/dev/tcp/"           # Bash network redirection
-    "base64.*decode"      # Base64 decoded executions
-    "python -c"           # Inline Python execution
-    "perl -e"             # Inline Perl execution
-)
-
-# Create pattern file
 > "$OUTPUT_DIR/suspicious_entries.txt"
-for pattern in "${SUSPICIOUS_PATTERNS[@]}"; do
-    echo "Checking for pattern: $pattern"
-    echo "=== Pattern: $pattern ===" >> "$OUTPUT_DIR/suspicious_entries.txt"
-    grep -E "$pattern" "$OUTPUT_DIR"/user_*_crontab.txt "$OUTPUT_DIR/system_crontabs.txt" >> "$OUTPUT_DIR/suspicious_entries.txt" 2>/dev/null || 
-        echo "No matches found" >> "$OUTPUT_DIR/suspicious_entries.txt"
-    echo "" >> "$OUTPUT_DIR/suspicious_entries.txt"
-done
+
+# Pattern 1: Curl piped to bash
+pattern="curl.*\\|.*bash"
+echo "Checking for pattern: $pattern"
+echo "=== Pattern: $pattern ===" >> "$OUTPUT_DIR/suspicious_entries.txt"
+grep -E "$pattern" "$OUTPUT_DIR"/user_*_crontab.txt "$OUTPUT_DIR/system_crontabs.txt" >> "$OUTPUT_DIR/suspicious_entries.txt" 2>/dev/null || 
+    echo "No matches found" >> "$OUTPUT_DIR/suspicious_entries.txt"
+echo "" >> "$OUTPUT_DIR/suspicious_entries.txt"
+
+# Pattern 2: Wget piped to bash
+pattern="wget.*\\|.*bash"
+echo "Checking for pattern: $pattern"
+echo "=== Pattern: $pattern ===" >> "$OUTPUT_DIR/suspicious_entries.txt"
+grep -E "$pattern" "$OUTPUT_DIR"/user_*_crontab.txt "$OUTPUT_DIR/system_crontabs.txt" >> "$OUTPUT_DIR/suspicious_entries.txt" 2>/dev/null || 
+    echo "No matches found" >> "$OUTPUT_DIR/suspicious_entries.txt"
+echo "" >> "$OUTPUT_DIR/suspicious_entries.txt"
+
+# Pattern 3: Netcat with execute flag
+pattern="nc -e"
+echo "Checking for pattern: $pattern"
+echo "=== Pattern: $pattern ===" >> "$OUTPUT_DIR/suspicious_entries.txt"
+grep -E "$pattern" "$OUTPUT_DIR"/user_*_crontab.txt "$OUTPUT_DIR/system_crontabs.txt" >> "$OUTPUT_DIR/suspicious_entries.txt" 2>/dev/null || 
+    echo "No matches found" >> "$OUTPUT_DIR/suspicious_entries.txt"
+echo "" >> "$OUTPUT_DIR/suspicious_entries.txt"
+
+# Pattern 4: Interactive bash shell
+pattern="bash -i"
+echo "Checking for pattern: $pattern"
+echo "=== Pattern: $pattern ===" >> "$OUTPUT_DIR/suspicious_entries.txt"
+grep -E "$pattern" "$OUTPUT_DIR"/user_*_crontab.txt "$OUTPUT_DIR/system_crontabs.txt" >> "$OUTPUT_DIR/suspicious_entries.txt" 2>/dev/null || 
+    echo "No matches found" >> "$OUTPUT_DIR/suspicious_entries.txt"
+echo "" >> "$OUTPUT_DIR/suspicious_entries.txt"
+
+# Pattern 5: Insecure permissions
+pattern="chmod 777"
+echo "Checking for pattern: $pattern"
+echo "=== Pattern: $pattern ===" >> "$OUTPUT_DIR/suspicious_entries.txt"
+grep -E "$pattern" "$OUTPUT_DIR"/user_*_crontab.txt "$OUTPUT_DIR/system_crontabs.txt" >> "$OUTPUT_DIR/suspicious_entries.txt" 2>/dev/null || 
+    echo "No matches found" >> "$OUTPUT_DIR/suspicious_entries.txt"
+echo "" >> "$OUTPUT_DIR/suspicious_entries.txt"
+
+# Pattern 6: Bash network redirection
+pattern="/dev/tcp/"
+echo "Checking for pattern: $pattern"
+echo "=== Pattern: $pattern ===" >> "$OUTPUT_DIR/suspicious_entries.txt"
+grep -E "$pattern" "$OUTPUT_DIR"/user_*_crontab.txt "$OUTPUT_DIR/system_crontabs.txt" >> "$OUTPUT_DIR/suspicious_entries.txt" 2>/dev/null || 
+    echo "No matches found" >> "$OUTPUT_DIR/suspicious_entries.txt"
+echo "" >> "$OUTPUT_DIR/suspicious_entries.txt"
+
+# Pattern 7: Base64 decoded executions
+pattern="base64.*decode"
+echo "Checking for pattern: $pattern"
+echo "=== Pattern: $pattern ===" >> "$OUTPUT_DIR/suspicious_entries.txt"
+grep -E "$pattern" "$OUTPUT_DIR"/user_*_crontab.txt "$OUTPUT_DIR/system_crontabs.txt" >> "$OUTPUT_DIR/suspicious_entries.txt" 2>/dev/null || 
+    echo "No matches found" >> "$OUTPUT_DIR/suspicious_entries.txt"
+echo "" >> "$OUTPUT_DIR/suspicious_entries.txt"
+
+# Pattern 8: Inline Python execution
+pattern="python -c"
+echo "Checking for pattern: $pattern"
+echo "=== Pattern: $pattern ===" >> "$OUTPUT_DIR/suspicious_entries.txt"
+grep -E "$pattern" "$OUTPUT_DIR"/user_*_crontab.txt "$OUTPUT_DIR/system_crontabs.txt" >> "$OUTPUT_DIR/suspicious_entries.txt" 2>/dev/null || 
+    echo "No matches found" >> "$OUTPUT_DIR/suspicious_entries.txt"
+echo "" >> "$OUTPUT_DIR/suspicious_entries.txt"
+
+# Pattern 9: Inline Perl execution
+pattern="perl -e"
+echo "Checking for pattern: $pattern"
+echo "=== Pattern: $pattern ===" >> "$OUTPUT_DIR/suspicious_entries.txt"
+grep -E "$pattern" "$OUTPUT_DIR"/user_*_crontab.txt "$OUTPUT_DIR/system_crontabs.txt" >> "$OUTPUT_DIR/suspicious_entries.txt" 2>/dev/null || 
+    echo "No matches found" >> "$OUTPUT_DIR/suspicious_entries.txt"
+echo "" >> "$OUTPUT_DIR/suspicious_entries.txt"
 
 # Create summary report
 TOTAL_MATCHES=$(grep -v "No matches found\|=== Pattern:" "$OUTPUT_DIR/suspicious_entries.txt" | grep -v "^$" | wc -l)

@@ -1,0 +1,75 @@
+---
+# Playbook: sgid_get.yml
+# Purpose: Find and report all files with SGID bit set on target systems
+- name: Check for SGID files
+  hosts: all
+  become: yes  # Run with elevated privileges
+  vars:
+    output_dir: "/tmp/security_audit"
+    timestamp: "{{ ansible_date_time.date }}_{{ ansible_date_time.time | regex_replace(':', '-') }}"
+    exclusion_paths:
+      - "/proc"
+      - "/sys"
+      - "/run"
+      - "/dev"
+      
+  tasks:
+    - name: Create local output directory if it doesn't exist
+      ansible.builtin.file:
+        path: "{{ output_dir }}"
+        state: directory
+        mode: '0755'
+      delegate_to: localhost
+      become: no
+      run_once: yes
+      
+    - name: Find all SGID files
+      ansible.builtin.shell: find / -path /proc -prune -o -path /sys -prune -o -path /run -prune -o -path /dev -prune -o -perm -2000 -type f -print 2>/dev/null
+      register: sgid_files
+      args:
+        executable: /bin/bash
+      changed_when: false
+      
+    - name: Save SGID files list to host-specific file
+      ansible.builtin.copy:
+        content: "# SGID Files on {{ inventory_hostname }} ({{ ansible_date_time.iso8601 }})\n{{ sgid_files.stdout }}"
+        dest: "{{ output_dir }}/{{ inventory_hostname }}_sgid_files_{{ timestamp }}.txt"
+      delegate_to: localhost
+      become: no
+      
+    - name: Count SGID files found
+      ansible.builtin.set_fact:
+        sgid_count: "{{ sgid_files.stdout_lines | length }}"
+        
+    - name: Show summary of SGID files found
+      ansible.builtin.debug:
+        msg: "Found {{ sgid_count }} SGID files on {{ inventory_hostname }}"
+        
+    - name: Create consolidated report
+      ansible.builtin.lineinfile:
+        path: "{{ output_dir }}/sgid_summary_{{ timestamp }}.csv"
+        line: "{{ inventory_hostname }},{{ ansible_distribution }},{{ ansible_distribution_version }},{{ sgid_count }}"
+        create: yes
+      delegate_to: localhost
+      become: no
+      
+    - name: Collect additional information about SGID files
+      ansible.builtin.shell: "ls -la {{ item }}"
+      loop: "{{ sgid_files.stdout_lines }}"
+      register: sgid_details
+      changed_when: false
+      when: sgid_files.stdout_lines | length > 0
+      
+    - name: Save detailed SGID file information
+      ansible.builtin.copy:
+        content: |
+          # Detailed SGID Files Information on {{ inventory_hostname }} ({{ ansible_date_time.iso8601 }})
+          {% for result in sgid_details.results %}
+          {% if result.stdout is defined %}
+          {{ result.stdout }}
+          {% endif %}
+          {% endfor %}
+        dest: "{{ output_dir }}/{{ inventory_hostname }}_sgid_details_{{ timestamp }}.txt"
+      delegate_to: localhost
+      become: no
+      when: sgid_files.stdout_lines | length > 0

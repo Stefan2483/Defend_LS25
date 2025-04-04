@@ -589,6 +589,78 @@ check_container_secrets() {
 }
 
 # Generate summary
+# Check for history files that might contain credentials
+check_history_files() {
+    section "Checking for shell history files"
+    
+    HISTORY_FILE="$OUTPUT_DIR/history_files.txt"
+    
+    # Shell history files
+    log "${CYAN}[*] Checking for shell history files${NC}"
+    find / -name ".bash_history" -o -name ".zsh_history" -o -name ".history" -o -name "*_history" 2>/dev/null | tee -a "$HISTORY_FILE"
+    
+    # Count results
+    if [ -f "$HISTORY_FILE" ]; then
+        history_count=$(wc -l < "$HISTORY_FILE")
+        log "${GREEN}[+] Found $history_count history files${NC}"
+        
+        # Keywords to look for in history files
+        HISTORY_KEYWORDS=("password" "passwd" "pass" "pwd" "secret" "key" "token" "cred" "ssh" "sudo" "su " "mysql -u" "psql -U" "scp" "rsync")
+        
+        # Create patterns for grep
+        HISTORY_PATTERN=$(printf "|%s" "${HISTORY_KEYWORDS[@]}")
+        HISTORY_PATTERN=${HISTORY_PATTERN:1}
+        
+        # Analyze each history file
+        while IFS= read -r history; do
+            if [ -r "$history" ]; then
+                log "${CYAN}[*] Analyzing history file: $history${NC}"
+                echo "History file: $history" >> "$OUTPUT_DIR/history_credentials.txt"
+                grep -E "$HISTORY_PATTERN" "$history" 2>/dev/null >> "$OUTPUT_DIR/history_credentials.txt"
+                echo "------------------------------" >> "$OUTPUT_DIR/history_credentials.txt"
+            fi
+        done < "$HISTORY_FILE"
+    else
+        log "${YELLOW}[!] No history files found${NC}"
+    fi
+}
+
+# Check for temporary files that might contain credentials
+check_temp_files() {
+    section "Checking for temporary files"
+    
+    TEMP_FILE="$OUTPUT_DIR/temp_files.txt"
+    
+    # Temporary directories
+    TEMP_DIRS=("/tmp" "/var/tmp" "/dev/shm" "/var/spool/cron" "/var/spool/at")
+    
+    for dir in "${TEMP_DIRS[@]}"; do
+        if [ -d "$dir" ]; then
+            log "${CYAN}[*] Checking temporary directory: $dir${NC}"
+            find "$dir" -type f -mtime -7 2>/dev/null | tee -a "$TEMP_FILE"
+        fi
+    done
+    
+    # Count results
+    if [ -f "$TEMP_FILE" ]; then
+        temp_count=$(wc -l < "$TEMP_FILE")
+        log "${GREEN}[+] Found $temp_count recent temporary files${NC}"
+        
+        # Sample 50 recent files to check for credentials
+        log "${CYAN}[*] Analyzing a sample of temporary files${NC}"
+        head -n 50 "$TEMP_FILE" | while read -r temp; do
+            if [ -r "$temp" ] && [ -f "$temp" ]; then
+                # Check if it's a text file
+                if file "$temp" | grep -q "text"; then
+                    grep -E "password|passwd|pass|pwd|secret|key|token|cred" "$temp" 2>/dev/null >> "$OUTPUT_DIR/temp_credentials.txt"
+                fi
+            fi
+        done
+    else
+        log "${YELLOW}[!] No temporary files found${NC}"
+    fi
+}
+
 generate_summary() {
     section "Generating summary"
     
@@ -599,4 +671,101 @@ generate_summary() {
     echo "Scan completed at: $(date)" >> "$SUMMARY_FILE"
     echo "" >> "$SUMMARY_FILE"
     
-    echo
+    # Add configuration files stats
+    if [ -f "$OUTPUT_DIR/config_files.txt" ]; then
+        config_count=$(wc -l < "$OUTPUT_DIR/config_files.txt")
+        echo "Configuration files found: $config_count" >> "$SUMMARY_FILE"
+    else
+        echo "Configuration files found: 0" >> "$SUMMARY_FILE"
+    fi
+    
+    # Add credential stats
+    if [ -f "$OUTPUT_DIR/found_credentials.txt" ]; then
+        cred_count=$(grep -c "Found potential credentials" "$OUTPUT_DIR/found_credentials.txt")
+        echo "Files with potential credentials: $cred_count" >> "$SUMMARY_FILE"
+    else
+        echo "Files with potential credentials: 0" >> "$SUMMARY_FILE"
+    fi
+    
+    # Add script stats
+    if [ -f "$OUTPUT_DIR/script_credentials.txt" ]; then
+        script_cred_count=$(grep -c "Found potential credentials" "$OUTPUT_DIR/script_credentials.txt")
+        echo "Scripts with potential credentials: $script_cred_count" >> "$SUMMARY_FILE"
+    else
+        echo "Scripts with potential credentials: 0" >> "$SUMMARY_FILE"
+    fi
+    
+    # Add interesting files stats
+    if [ -f "$OUTPUT_DIR/interesting_files.txt" ]; then
+        interesting_count=$(wc -l < "$OUTPUT_DIR/interesting_files.txt")
+        echo "Interesting files found: $interesting_count" >> "$SUMMARY_FILE"
+    else
+        echo "Interesting files found: 0" >> "$SUMMARY_FILE"
+    fi
+    
+    # Add database stats
+    if [ -f "$OUTPUT_DIR/database_configs.txt" ]; then
+        db_count=$(wc -l < "$OUTPUT_DIR/database_configs.txt")
+        echo "Database configuration files found: $db_count" >> "$SUMMARY_FILE"
+    else
+        echo "Database configuration files found: 0" >> "$SUMMARY_FILE"
+    fi
+    
+    # Add cloud credentials stats
+    if [ -f "$OUTPUT_DIR/cloud_credentials.txt" ]; then
+        cloud_count=$(wc -l < "$OUTPUT_DIR/cloud_credentials.txt")
+        echo "Cloud credential files found: $cloud_count" >> "$SUMMARY_FILE"
+    else
+        echo "Cloud credential files found: 0" >> "$SUMMARY_FILE"
+    fi
+    
+    echo "" >> "$SUMMARY_FILE"
+    echo "Most critical findings:" >> "$SUMMARY_FILE"
+    
+    # List top findings - SSH keys
+    find "$OUTPUT_DIR" -type f -exec grep -l "BEGIN.*PRIVATE KEY" {} \; 2>/dev/null | sort | uniq | head -n 5 >> "$SUMMARY_FILE"
+    
+    # List files with most credential patterns
+    if [ -f "$OUTPUT_DIR/found_credentials.txt" ]; then
+        echo "" >> "$SUMMARY_FILE"
+        echo "Files with most credential patterns:" >> "$SUMMARY_FILE"
+        grep "Found potential credentials" "$OUTPUT_DIR/found_credentials.txt" | sort | uniq -c | sort -nr | head -n 5 >> "$SUMMARY_FILE"
+    fi
+    
+    log "${GREEN}[+] Summary generated in $SUMMARY_FILE${NC}"
+}
+
+# Main function
+main() {
+    print_banner
+    check_root
+    setup_output
+    
+    # Core checks
+    find_config_files
+    analyze_files
+    check_scripts
+    check_interesting_files
+    
+    # Extended checks
+    check_dotnet_configs
+    check_java_files
+    check_cloud_credentials
+    check_database_configs
+    check_container_secrets
+    check_history_files
+    check_temp_files
+    
+    # Generate report
+    generate_summary
+    
+    # Final output
+    section "Scan completed"
+    log "${GREEN}[+] CredentialFinder scan completed${NC}"
+    log "${GREEN}[+] Results saved to $OUTPUT_DIR${NC}"
+    log "${GREEN}[+] Summary: $SUMMARY_FILE${NC}"
+    log "${YELLOW}[!] Remember to secure any sensitive information found${NC}"
+}
+
+# Run the script
+main
